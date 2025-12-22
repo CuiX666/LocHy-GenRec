@@ -1,0 +1,1932 @@
+#动态的修改
+import os
+os.environ['TRITON_PTXAS_PATH'] = ''
+os.environ["TORCH_LIBRARY_ALLOW_DUPLICATE_REGISTRATION"] = "1"
+# os.environ['CUDA_MODULE_LOADING'] = 'LAZY'
+os.environ['HF_ENDPOINT'] = 'https://hf-mirror.com'
+import logging #忽视transformes警告
+import torch.nn as nn
+import json
+import hashlib
+import time
+import re
+from typing import Dict, List, Optional
+import numpy as np
+from pathlib import Path
+from typing import List, Dict, Tuple
+from transformers import AutoTokenizer, AutoModelForCausalLM, BitsAndBytesConfig, get_scheduler
+from transformers import AutoModel
+
+import torch
+from cachetools import TTLCache 
+from peft import LoraConfig, get_peft_model
+from sentence_transformers import SentenceTransformer  
+from torch.utils.data import DataLoader, Dataset
+from tqdm import tqdm
+os.environ.pop("HUGGINGFACEHUB_API_TOKEN", None)  
+# os.environ["HTTP_PROXY"] = "http://your-proxy:port"
+import torch.nn as nn
+
+CONFIG = {
+    "items_json": "/home/One/data/Instruments/Instruments.item.json",          # 商品数据文件
+    "users_json": "/home/One/data/Instruments/ce_shi.results.json",          # 用户数据文件（测试）
+    # "users_json": "/home/One/data/Instruments/Instruments.results - 副本.json",          # 用户数据文件（测试）
+
+    "static_identifiers_json": "/home/One/data/Instruments/Instruments.index.json",  # 新增静态标识符文件路径
+    
+    "output_dir": "/home/One/data/Instruments/recommendation_results_xiugai912",    # 输出目录
+    "model_name": "/home/ubuntu/Public/Llama-3.2-1B",
+    # "model_name": "/home/ubuntu/Public/Qwen2.5-0.5B",
+    "max_new_tokens": 300,                       # 调整生成长度
+    "history_length": 6,                         # 用户历史交互保留长度
+    "top_k": 20,                                  # 推荐列表长度  
+    "test_ratio": 0.1,                            # 测试集比例
+    "train_epochs": 10,
+    "learning_rate": 1e-4,
+    "lora_config": { 
+        "r": 8,
+        "lora_alpha": 32,
+        "lora_dropout": 0.1,
+        "target_modules": ["q_proj", "v_proj"]
+    },
+    "checkpoint_dir": "/home/One/data/Instruments/checkpoints",
+    "identifier_model": {
+        "diversity_lambda": 0.1,  # 多样性损失权重
+        "num_variants": 1,        # 每个商品生成的变体数量
+        "semantic_threshold": 0.65, # 语义相似度阈值
+        "temperature_schedule": {
+            "base": 0.7,
+            "max": 1.5,
+            "steps": 1000
+        }
+    },
+}
+logging.getLogger("transformers").setLevel(logging.ERROR)
+
+
+
+# 缺失的微调应用层
+class InstructionFineTuner:
+    def __init__(self, model, tokenizer):
+        self.model = model
+        self.tokenizer = tokenizer
+    
+    def apply_fine_tuning(self, instruction_dataset):
+        """执行指令微调"""
+        if not instruction_dataset:
+            raise ValueError("指令数据集为空，无法进行微调")
+            
+        optimizer = torch.optim.AdamW(self.model.parameters(), lr=1e-5)
+        
+        for epoch in range(5):
+            total_loss = 0
+            for instruction, target in instruction_dataset:
+                try:
+                    # 组合指令和目标
+                    full_text = f"{instruction} {target}"
+                    
+                    # 编码输入
+                    inputs = self.tokenizer(
+                        full_text,
+                        return_tensors="pt",
+                        padding="max_length",
+                        truncation=True,
+                        max_length=512
+                    ).to(self.model.device)
+                    
+                    # 计算指令部分的长度
+                    instruction_inputs = self.tokenizer(
+                        instruction,
+                        return_tensors="pt",
+                        max_length=512,
+                        truncation=True
+                    )
+                    prompt_len = instruction_inputs.input_ids.size(1)
+                    
+                    # 创建标签（仅目标部分）
+                    labels = inputs.input_ids.clone()
+                    labels[:, :prompt_len] = -100  # 忽略指令部分的损失
+                    
+                    # 模型前向传播
+                    outputs = self.model(
+                        input_ids=inputs.input_ids,
+                        attention_mask=inputs.attention_mask,
+                        labels=labels
+                    )
+                    
+                    loss = outputs.loss
+                    total_loss += loss.item()
+                    
+                    # 反向传播
+                    optimizer.zero_grad()
+                    loss.backward()
+                    optimizer.step()
+                    
+                except Exception as e:
+                    print(f"处理样本时出错: {str(e)}")
+                    continue
+            
+            avg_loss = total_loss / len(instruction_dataset)
+            print(f"Epoch {epoch+1} | Loss: {avg_loss:.4f}")
+        
+        return self.model
+
+class InstructionDatasetBuilder:
+    def __init__(self, users, items):
+        self.users = users
+        self.items = items
+    
+    def build_dataset(self):
+        """构建指令微调数据集"""
+        dataset = []
+        valid_users = 0
+        
+        for user_id, user_data in self.users.items():
+            # 数据验证
+            if not self._validate_user_data(user_id, user_data):
+                continue
+                
+            valid_users += 1
+            
+            try:
+                # 生成三种任务的指令-目标对
+                seq_samples = self._generate_sequence_prediction_samples(user_id, user_data)
+                text_samples = self._generate_text_to_id_samples(user_id, user_data)
+                id_samples = self._generate_id_to_text_samples(user_id, user_data)
+                # print(seq_samples)
+                dataset.extend(seq_samples)
+                dataset.extend(text_samples)
+                dataset.extend(id_samples)
+                
+            except Exception as e:
+                print(f"处理用户 {user_id} 时出错: {str(e)}")
+        
+        print(f"数据集构建完成，有效用户: {valid_users}, 总样本数: {len(dataset)}")
+        return dataset
+    
+    def _validate_user_data(self, user_id, user_data):
+        """验证用户数据完整性"""
+        required_fields = ["cluster", "interacted_items"]
+        missing_fields = [field for field in required_fields if field not in user_data]
+        
+        if missing_fields:
+            print(f"警告：用户 {user_id} 缺少字段 {missing_fields}，跳过")
+            return False
+            
+        if len(user_data["interacted_items"]) < 2:
+            print(f"警告：用户 {user_id} 交互历史不足，跳过")
+            return False
+            
+        return True
+    
+    def _generate_sequence_prediction_samples(self, user_id, user_data):
+        """生成序列预测任务样本"""
+        samples = []
+        interactions = user_data["interacted_items"]
+        
+        # 确保有足够的交互历史
+        if len(interactions) < 2:
+            return samples
+            
+        # 获取最后一个物品作为目标
+        last_item_id = interactions[-1]
+        if last_item_id not in self.items:
+            print(f"警告：目标商品 {last_item_id} 不存在，跳过序列预测任务")
+            return samples
+            
+        last_item = self.items[last_item_id]
+        
+        # 构建上下文物品列表
+        context_items = [self.items[item_id] for item_id in interactions[:-1] if item_id in self.items]
+        
+        instruction = self._create_sequence_prediction_instruction(
+            user_id=user_id,
+            user_cluster=user_data["cluster"],
+            context_items=context_items,
+            next_item=last_item
+        )
+        
+        target = " ".join(last_item["identifiers"])
+        samples.append((instruction, target))
+        
+        return samples
+    
+    def _generate_text_to_id_samples(self, user_id, user_data):
+        """生成文本到标识符任务样本"""
+        samples = []
+        interactions = user_data["interacted_items"]
+        
+        for item_id in interactions:
+            if item_id not in self.items:
+                print(f"警告：商品 {item_id} 不存在，跳过文本→标识符任务")
+                continue
+                
+            item = self.items[item_id]
+            context_items = [self.items[ctx_id] for ctx_id in interactions if ctx_id != item_id and ctx_id in self.items]
+            
+            instruction = self._create_text_to_id_instruction(
+                user_id=user_id,
+                user_cluster=user_data["cluster"],
+                description=item["description"],
+                context_items=context_items
+            )
+            
+            target = " ".join(item["identifiers"])
+            samples.append((instruction, target))
+            
+        return samples
+    
+    def _generate_id_to_text_samples(self, user_id, user_data):
+        """生成标识符到文本任务样本"""
+        samples = []
+        interactions = user_data["interacted_items"]
+        
+        for item_id in interactions:
+            if item_id not in self.items:
+                continue
+                
+            item = self.items[item_id]
+            context_items = [self.items[ctx_id] for ctx_id in interactions if ctx_id != item_id and ctx_id in self.items]
+            
+            instruction = self._create_id_to_text_instruction(
+                user_id=user_id,
+                user_cluster=user_data["cluster"],
+                identifiers=" ".join(item["identifiers"]),
+                context_items=context_items
+            )
+            
+            target = item["description"]
+            samples.append((instruction, target))
+            
+        return samples
+    
+    def _create_sequence_prediction_instruction(self, user_id, user_cluster, context_items, next_item):
+        """创建序列预测指令"""
+        context_str = "\n".join(
+            f"- {item['title']} ({item.get('brand', '')}): {' '.join(item['identifiers'])}"
+            for item in context_items[:3]
+        )
+        
+        return f"""
+用户: {user_id}, 该用户属于长期粗粒度聚类 {user_cluster['stage1']}, 
+最终用户类别是 {user_cluster['final']}, 
+近期交互历史:
+{context_str}
+请预测用户接下来可能交互的物品标识符:
+{' '.join(next_item['identifiers'])}
+"""
+    
+    def _create_text_to_id_instruction(self, user_id, user_cluster, description, context_items):
+        """创建文本转标识符指令"""
+        context_str = "\n".join(
+            f"- {item['title']} ({item.get('brand', '')})"
+            for item in context_items[:3]
+        )
+        
+        return f"""
+用户: {user_id}, 该用户属于长期粗粒度聚类 {user_cluster['stage1']}, 
+最终用户类别是 {user_cluster['final']}, 
+物品描述: "{description}"
+相关交互历史:
+{context_str}
+请生成对应的物品标识符:
+"""
+    
+    def _create_id_to_text_instruction(self, user_id, user_cluster, identifiers, context_items):
+        """创建标识符转文本指令"""
+        context_str = "\n".join(
+            f"- {item['title']} ({item.get('brand', '')})"
+            for item in context_items[:3]
+        )
+        
+        return f"""
+用户: {user_id}, 该用户属于长期粗粒度聚类 {user_cluster['stage1']}, 
+最终用户类别是 {user_cluster['final']}, 
+物品标识符: {identifiers}
+相关交互历史:
+{context_str}
+请描述该物品特征:
+"""
+    # def create_preference_inference_instruction(user, item_sequence):
+    #     return f"""
+    # 用户: {user.id}, 该用户属于长期粗粒度聚类 {user.cluster['stage1']}, 
+    # 最终用户类别是 {user.cluster['final']}, 
+    # 交互物品标识符序列: {' '.join([item['identifiers'] for item in item_sequence])}
+    # 请分析用户偏好:
+    # {user.preference_description}
+    # """
+    ##############################
+        for user in self.users:
+            # 1. 序列预测任务调用
+            seq_instruction = create_sequence_prediction_instruction(
+                user=user,
+                item_sequence=user.interactions[:-1]
+            )
+            seq_target = self.items[user.interactions[-1]].identifiers
+            dataset.append((seq_instruction, seq_target))
+            
+            # 2. 文本→标识符任务调用
+            for item_id in user.interactions:
+                item = self.items[item_id]
+                text_instruction = create_text_to_id_instruction(
+                    user=user,
+                    description=item.description,
+                    item_sequence=user.interactions[:-1]
+                )
+                text_target = item.identifiers
+                dataset.append((text_instruction, text_target))
+                
+            # 3. 标识符→文本任务调用
+            for item_id in user.interactions:
+                item = self.items[item_id]
+                id_instruction = create_id_to_text_instruction(
+                    user=user,
+                    identifiers=item.identifiers,
+                    item_sequence=user.interactions[:-1]
+                )
+                id_target = item.description
+                dataset.append((id_instruction, id_target))
+                
+            # # 4. 用户偏好推断任务调用
+            # pref_instruction = create_preference_inference(
+            #     user=user,
+            #     item_sequence=user.interactions
+            # )
+            # pref_target = user.preference_description
+            # dataset.append((pref_instruction, pref_target))
+        
+        return dataset
+    
+from typing import Dict, Optional
+class TwoLayerMapper:
+    """专用于前两层标识符的映射器"""
+    def __init__(self, items: Dict):
+        """
+        初始化映射器
+        
+        参数:
+            items: 商品字典，格式为 {
+                item_id: {
+                    "identifiers": List[str],  # 四层标识符
+                    ...其他字段...
+                }
+            }
+        """
+        self.items = items
+        self.ab_mapping = self._build_ab_mapping()
+    
+    def _build_ab_mapping(self) -> Dict[str, str]:
+        """构建前两层标识符到商品ID的映射"""
+        mapping = {}
+        for item_id, item in self.items.items():
+            if not self._valid_identifiers(item.get("identifiers", [])):
+                continue
+            ab_key = self._get_ab_pair(item["identifiers"])
+            mapping[ab_key] = item_id
+            print("{}-----{}".format(ab_key, item_id))
+        return mapping
+    
+    def _valid_identifiers(self, identifiers: List[str]) -> bool:
+        """验证标识符是否有效"""
+        return len(identifiers) >= 2 and all(isinstance(i, str) for i in identifiers[:2])
+    
+    def _get_ab_pair(self, identifiers: List[str]) -> str:
+        """提取前两层标识符组合"""
+        return " ".join(identifiers[:2])
+    
+    def get_item_id(self, ab_pair: str) -> Optional[str]:
+        """通过前两层标识符获取商品ID"""
+        return self.ab_mapping.get(ab_pair)
+
+class RecommendationEngine:
+    def create_sequence_prediction_instruction(user, item_sequence, next_item):
+        return f"""
+    用户: {user.id}, 该用户属于长期粗粒度聚类 {user.cluster['stage1']}, 
+    最终用户类别是 {user.cluster['final']}, 
+    交互物品标识符序列: {' '.join([item['identifiers'] for item in item_sequence])}
+    请预测用户接下来可能交互的物品标识符:
+    {next_item['identifiers']}
+    """
+    def generate_recommendation(self, user, context_items):
+        # 构建指令
+        instruction = self._build_recommendation_instruction(user, context_items)
+        
+        # 调用模型生成
+        inputs = self.tokenizer(instruction, return_tensors="pt")
+        outputs = self.model.generate(
+            **inputs,
+            max_new_tokens=100,
+            temperature=0.7
+        )
+        
+        # 解析结果
+        response = self.tokenizer.decode(outputs[0], skip_special_tokens=True)
+        return self._parse_recommendation(response)
+    
+    def _build_recommendation_instruction(self, user, context_items):
+        """调用序列预测指令模板"""
+        return self.create_sequence_prediction_instruction(
+            user_id=user,  # 使用user_id而不是user.id
+            user_cluster=user["cluster"],
+            item_sequence=user["interacted_items"][:-1],
+            next_item_id=user["interacted_items"][-1]
+        )
+    
+    def generate_dynamic_identifier(self, item, user_cluster, context_items):
+        # 调用动态内容生成指令
+        prompt = self._build_dynamic_prompt(item, user_cluster, context_items)
+        
+        # 调用LLM生成
+        inputs = self.tokenizer(prompt, return_tensors="pt")
+        outputs = self.llm.generate(**inputs, output_hidden_states=True)
+        
+        # 处理结果
+        return self._extract_identifiers(outputs)
+##############################
+
+class SharedCodebookEncoder(nn.Module):
+    """共享码本编码器（编码范围1-255）"""
+    def __init__(self, codebook_size=255, embedding_dim=64):
+        super().__init__()
+        self.codebook_size = codebook_size
+        self.embedding_dim = embedding_dim
+        
+        # 初始化共享码本（索引从1开始）
+        self.codebook = nn.Embedding(codebook_size + 1, embedding_dim)  # 0-255
+        nn.init.uniform_(self.codebook.weight, -1.0, 1.0)
+        
+        # 投影层，将LLM隐藏状态映射到码本维度
+        self.projection = nn.Linear(896, embedding_dim)  # Qwen2.5-0.5B的隐藏层维度为896
+    
+    def encode(self, hidden_state: torch.Tensor) -> str:
+        """编码隐藏状态为标识符（确保输出1-255）"""
+        # 投影到码本维度
+        projected = self.projection(hidden_state.unsqueeze(0))  # [1, embedding_dim]
+        
+        # 计算与码本的距离 [1, codebook_size]
+        distances = torch.cdist(
+            projected,  # [1, embedding_dim]
+            self.codebook.weight[1:].unsqueeze(0),  # 跳过0索引 [1, codebook_size, embedding_dim]
+            p=2
+        ).squeeze(0)
+        
+        # 获取最近邻索引（范围1-255）
+        quant_idx = torch.argmin(distances).item() + 1  # 补偿跳过的0索引
+        
+        # 转换为十进制字符串
+        return f"{quant_idx}"
+
+class DynamicIdentifierGenerator:
+    """基于共享码本的动态标识符生成器"""
+    def __init__(self, llm_path: str, static_id_path: str):
+        # 初始化LLM
+        self.tokenizer = AutoTokenizer.from_pretrained(llm_path)
+        self.llm = AutoModel.from_pretrained(llm_path).cuda()
+        self.llm.eval()
+        
+        # # 加载静态标识符
+        # with open(static_id_path, 'r') as f:
+        #     self.static_ids = json.load(f)
+        #     self.static_ids = {str(k): v for k, v in self.static_ids.items()}
+        
+        # 初始化共享编码器并移动到CUDA
+        self.encoder = SharedCodebookEncoder().to(self.llm.device)
+        
+        # 定义关键token
+        self.feature_token = "<CONTENT_2>"
+        self.scene_token = "<CONTENT_3>"
+        
+        # 添加特殊token
+        self.tokenizer.add_tokens([self.feature_token, self.scene_token])
+        self.llm.resize_token_embeddings(len(self.tokenizer))
+    
+    def generate_full_identifiers(self, item: Dict, context: List[Dict], cluster,context_items) -> List[str]:
+        """生成完整的四层标识符"""
+        # # 获取静态标识符或生成a/b层
+        # item_id = str(item["id"])
+        # if item_id in self.static_ids and len(self.static_ids[item_id]) >= 2:
+        #     a, b = self.static_ids[item_id][0], self.static_ids[item_id][1]
+        # else:
+        #     a = self._generate_hash_layer("a", item["brand"])
+        #     b = self._generate_hash_layer("b", item["categories"], a)
+        
+        # 生成动态标识符c/d（使用共享码本）
+        c, d = self._generate_shared_codebook_ids(item, context,cluster,context_items)
+        
+        return [c, d]
+    
+    def _generate_shared_codebook_ids(self, item: Dict, cluster: Dict, context_items: List[Dict]) -> Tuple[str, str]:
+        """使用共享码本生成c/d标识符"""
+        # 构建提示词
+        prompt = self._build_dual_token_prompt(item, cluster,context_items)
+        
+        # 获取LLM输出
+        with torch.no_grad():
+            inputs = self.tokenizer(
+                prompt,
+                return_tensors="pt",
+                padding=True,
+                truncation=True,
+                max_length=512
+            ).to(self.llm.device)
+            
+            outputs = self.llm(**inputs, output_hidden_states=True)
+            
+            # # 获取关键token的位置
+            # feature_pos = (inputs.input_ids[0] == self.tokenizer.convert_tokens_to_ids(self.feature_token)).nonzero().item()
+            # scene_pos = (inputs.input_ids[0] == self.tokenizer.convert_tokens_to_ids(self.scene_token)).nonzero().item()
+            
+            # 获取关键token的位置（修复点1：添加空值检查）
+            feature_token_id = self.tokenizer.convert_tokens_to_ids(self.feature_token)
+            scene_token_id = self.tokenizer.convert_tokens_to_ids(self.scene_token)
+            
+            # 修复点2：安全获取特征token位置
+            feature_positions = (inputs.input_ids[0] == feature_token_id).nonzero()
+            if len(feature_positions) == 0:
+                # 修复点3：处理未找到token的情况
+                print(f"警告：特征token '{self.feature_token}' 未在输入序列中找到，使用默认位置")
+                feature_pos = 0  # 使用序列起始位置
+            else:
+                feature_pos = feature_positions[0].item()
+            
+            # 修复点4：安全获取场景token位置
+            scene_positions = (inputs.input_ids[0] == scene_token_id).nonzero()
+            if len(scene_positions) == 0:
+                print(f"警告：场景token '{self.scene_token}' 未在输入序列中找到，使用默认位置")
+                scene_pos = 1  # 使用序列第二个位置
+            else:
+                scene_pos = scene_positions[0].item()
+            
+            # 获取最后层的隐藏状态
+            last_hidden = outputs.hidden_states[-1]
+            
+            # 提取特征和场景的隐藏状态
+            feature_hidden = last_hidden[0, feature_pos, :]
+            scene_hidden = last_hidden[0, scene_pos, :]
+        
+        # 使用共享码本编码（确保范围1-255）
+        c_code = self.encoder.encode(feature_hidden)
+        d_code = self.encoder.encode(scene_hidden)
+        
+        return f"<c_{c_code}>", f"<d_{d_code}>"
+    
+    def _build_dual_token_prompt(self, item: Dict, cluster: Dict, context_items: List[Dict]) -> str:
+        """构建双token提示词"""
+        context_desc = "\n".join(
+            f"- {ctx['title']} ({ctx.get('brand', '')}): {ctx['description'][:100]}..."
+            for ctx in context_items[:3]
+        )
+        neighbor_info = "、".join([f"{i['title']}" for i in context_items])
+#         print(f"""商品分析：
+# This is the item {item['title']} that the user interacted with,   the long-term coarse-grained cluster of this user is:{cluster['stage1']}, and the final user category is: {cluster['final']}, 
+# 品牌：{item.get('brand', '')}
+# 分类：{item.get('categories', '')}
+# 描述：{item['description'][:200]}...
+# 相关商品：
+# {context_desc}
+# the most recently interacted with item are: {neighbor_info}. The generated dynamic content representation should have two dynamic content tokens as follows:
+# <CONTENT_2><CONTENT_3>
+
+# """)
+        return f"""商品特征分析：
+This is the item {item['title']} that the user interacted with,   the long-term coarse-grained cluster of this user is:{cluster['stage1']}, and the final user category is: {cluster['final']}, 
+品牌：{item.get('brand', '')}
+分类：{item.get('categories', '')}
+描述：{item['description'][:200]}...
+相关商品：
+{context_desc}
+the most recently interacted with item are: {neighbor_info}. The generated dynamic content representation should have two dynamic content tokens as follows:
+<CONTENT_2><CONTENT_3>
+
+"""
+    
+    def _generate_hash_layer(self, prefix: str, content: str, prev_hash: str = "") -> str:
+        """生成哈希层标识符"""
+        hash_seed = f"{prev_hash}{content}".encode()
+        hash_bytes = hashlib.blake2b(
+            hash_seed,
+            digest_size=4,
+            key=prefix.encode()
+        ).digest()
+        return f"<{prefix}_{hash_bytes.hex()[:6]}>"
+
+
+
+class DiversityLoss(nn.Module):
+    """促进特征多样性的损失函数"""
+    def __init__(self, lambda_div=0.3):
+        super().__init__()
+        self.lambda_div = lambda_div
+        self.cos = nn.CosineSimilarity(dim=-1)
+
+    def forward(self, hidden_states):
+        """
+        hidden_states: (batch_size, seq_len, hidden_dim)
+        """
+        batch_size, seq_len, hidden_dim = hidden_states.size()    
+        
+        # 计算序列内所有位置的相似度
+        sim_matrix = torch.zeros(batch_size, seq_len, seq_len, device=hidden_states.device)
+        for i in range(seq_len):
+            # 逐行计算相似度
+            sim_matrix[:, i, :] = self.cos(
+                hidden_states[:, i:i+1],  # (b,1,dim)
+                hidden_states  # (b,seq,dim)
+            )
+        
+        # 掩码对角线
+        mask = torch.eye(seq_len, device=sim_matrix.device).bool()
+        sim_matrix = sim_matrix.masked_fill(mask, 0)
+        
+        # 计算平均相似度
+        diversity_loss = torch.mean(sim_matrix) 
+        
+        return self.lambda_div * diversity_loss
+
+class IdentifierDataset(Dataset):
+    """标识符生成训练数据集"""
+    def __init__(self, users, items, id_generator, base_model, tokenizer, static_identifiers,num_variants=1):
+        self.items = items
+        self.id_generator = id_generator 
+        self.base_model = base_model
+        self.tokenizer = tokenizer
+        self.static_identifiers = static_identifiers  # 新增：静态标识符字典
+        self.examples = []
+        
+        # id_generator=ModelDrivenIdentifierGenerator()
+        for uid, user in users.items():
+            interactions = user["interacted_items"]
+            for i, item_id in enumerate(interactions):
+                # 确保 item_id 是字符串类型
+                item_id_str = str(item_id)
+                if item_id_str not in self.items:
+                    print(f"警告：商品 {item_id_str} 不存在于 items 中，跳过")
+                    continue
+                    
+                context = interactions[max(0,i-1):i+2]
+                context_items = [ctx_id for ctx_id in context if ctx_id != item_id_str]
+                
+                for _ in range(num_variants):
+                    identifiers = self.id_generator.generate(
+                        item=self.items[item_id_str],
+                        user_cluster=user["cluster"],
+                        cluster=user["cluster"],  # 新增cluster参数
+                        context_items=[self.items[ctx_id] for ctx_id in context_items if ctx_id in self.items]
+                    )
+                    input_text = self._build_input(self.items[item_id_str], user["cluster"], context_items)
+                    target_text = " ".join(identifiers)
+                    
+                    self.examples.append({
+                        "input": input_text,
+                        "target": target_text,
+                        "cluster": user["cluster"],
+                        "context": context_items,
+                        "item_id": item_id_str
+                    })
+
+    def _build_input(self, item, cluster, context_items):
+        context_items = [self.items[ctx_id] for ctx_id in context_items]
+        neighbors = "，".join([i["title"] for i in context_items])
+        return (
+            f"用户类型：{cluster}\n"
+            f"当前物品：{item['title']}\n"
+            f"相邻物品：{neighbors}"
+        )
+    
+    def __len__(self):
+        return len(self.examples)
+    
+    def __getitem__(self, idx):
+        example = self.examples[idx]
+        item = self.items[example["item_id"]]
+        return {
+            **example,
+            **item
+        }
+        # return self.examples[idx]
+
+class ModelDrivenIdentifierGenerator:
+    """基于LLM的标识符生成器（修改后）"""
+    def __init__(self, base_model, tokenizer, static_identifiers: Dict):
+        self.base_model = base_model
+        self.tokenizer = tokenizer
+        self.static_identifiers = static_identifiers  # 新增：静态标识符字典
+        self.diversity_loss = DiversityLoss(CONFIG["identifier_model"]["diversity_lambda"])
+        self.cache = TTLCache(maxsize=10000, ttl=3600)
+        
+        # 加载语义验证模型
+        try:
+            self.semantic_validator = SentenceTransformer.from_pretrained(
+                '/home/ubuntu/Public/MiniLM',
+                local_files_only=True
+            )
+        except Exception as e:
+            print(f"加载本地SentenceTransformer失败: {str(e)}")
+            self.semantic_validator = SentenceTransformer('sentence-transformers/all-MiniLM-L6-v2', token=False)
+
+    def mean_pooling(self, model_output, attention_mask):
+        token_embeddings = model_output[0]
+        input_mask_expanded = attention_mask.unsqueeze(-1).expand(token_embeddings.size()).float()
+        return torch.sum(token_embeddings * input_mask_expanded, 1) / torch.clamp(input_mask_expanded.sum(1), min=1e-9)
+
+    def _generate_layer(self, prefix: str, content: str, prev_hash: str = "") -> str:
+        """生成基础哈希层（备用方案）"""
+        hash_seed = f"{prev_hash}{content}".encode()
+        hash_bytes = hashlib.blake2b(
+            hash_seed,
+            digest_size=2,
+            key=prefix.encode()
+        ).digest()
+        return f"<{prefix}_{hash_bytes.hex()[:4]}>"
+
+    def generate(self, item: Dict, user_cluster: str, cluster: Dict, context_items: List[Dict]) -> List[str]:
+        """生成四层标识符（修改后核心逻辑）"""
+        # 优先从静态文件读取前两层标识符
+        item_id = item["id"]  # 假设商品数据中包含"id"字段（需与JSON文件键匹配）
+        static_ids = self.static_identifiers.get(str(item_id))  # JSON键为字符串
+        # 初始化生成器
+        generator = DynamicIdentifierGenerator(
+            llm_path="/home/ubuntu/Public/Qwen2.5-0.5B",
+            static_id_path="/home/One/data/Instruments/Instruments.index.json"
+        )
+        if static_ids and len(static_ids) >= 2:
+            a = static_ids[0]  # 第一层取第一个标识符
+            b = static_ids[1]  # 第二层取第二个标识符
+            #print(item_id,a,b)
+            item["identifiers"]=[a,b]
+            print("------------------------------------------")
+            print(item)
+        else:
+            # print("@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@")
+            # 回退到动态生成（原始逻辑）
+            a = self._generate_layer("a", item["brand"])
+            b = self._generate_layer("b", item["categories"], a)
+        
+        # 模型驱动层保持不变
+        # c, d = self._generate_model_layers(item, user_cluster, context_items)
+        c, d = generator._generate_shared_codebook_ids(
+            item=item,
+            cluster=cluster,
+            context_items=context_items  # 确保传入所有必需参数
+        )
+        s_identifiers=[a,b]
+        d_identifiers=[c,d]
+        # print(f"警告：商品 {item_id} 缺少description_hash，使用备用缓存键")
+        identifiers = [a, b, c, d]
+        item["identifiers"]=identifiers
+        print(item_id,identifiers)
+        self.cache[f"{item['title']}-{item['description_hash']}"] = identifiers
+        return identifiers
+
+    
+    
+    def _generate_shared_codebook_ids(self, item: Dict, context: List[Dict]) -> Tuple[str, str]:
+        """使用共享码本生成c/d标识符"""
+        # 构建提示词
+        prompt = self._build_dual_token_prompt(item, context)
+        
+        # 获取LLM输出
+        with torch.no_grad():
+            inputs = self.tokenizer(
+                prompt,
+                return_tensors="pt",
+                padding=True,
+                truncation=True,
+                max_length=512
+            ).to(self.llm.device)
+            
+            outputs = self.llm(**inputs, output_hidden_states=True)
+            
+            # 获取关键token的位置
+            feature_pos = (inputs.input_ids[0] == self.tokenizer.convert_tokens_to_ids(self.feature_token)).nonzero().item()
+            scene_pos = (inputs.input_ids[0] == self.tokenizer.convert_tokens_to_ids(self.scene_token)).nonzero().item()
+            
+            # 获取最后层的隐藏状态
+            last_hidden = outputs.hidden_states[-1]
+            
+            # 提取特征和场景的隐藏状态
+            feature_hidden = last_hidden[0, feature_pos, :]
+            scene_hidden = last_hidden[0, scene_pos, :]
+        
+        # 使用共享码本编码（确保范围1-255）
+        c_code = self.encoder.encode(feature_hidden)
+        d_code = self.encoder.encode(scene_hidden)
+        
+        return f"<c_{c_code}>", f"<d_{d_code}>"
+    
+    def _build_dual_token_prompt(self, item: Dict, context: List[Dict],cluster,context_items) -> str:
+        """构建双token提示词"""
+        context_desc = "\n".join(
+            f"- {ctx['title']} ({ctx.get('brand', '')}): {ctx['description'][:100]}..."
+            for ctx in context[:3]
+        )
+        neighbor_info = "、".join([f"{i['title']}" for i in context_items])
+#         print(f"""商品特征分析：
+# This is the item {item['title']} that the user interacted with,   the long-term coarse-grained cluster of this user is:{cluster['stage1']}, and the final user category is: {cluster['final']}, 
+# 品牌：{item.get('brand', '')}
+# 分类：{item.get('categories', '')}
+# 描述：{item['description'][:200]}...
+# 相关商品：
+# {context_desc}
+# the most recently interacted with item are: {neighbor_info}. The generated dynamic content representation should have two dynamic content tokens as follows:
+# <CONTENT_2><CONTENT_3>
+
+# """)
+        return f"""商品特征分析：
+This is the item {item['title']} that the user interacted with,   the long-term coarse-grained cluster of this user is:{cluster['stage1']}, and the final user category is: {cluster['final']}, 
+品牌：{item.get('brand', '')}
+分类：{item.get('categories', '')}
+描述：{item['description'][:200]}...
+相关商品：
+{context_desc}
+the most recently interacted with item are: {neighbor_info}. The generated dynamic content representation should have two dynamic content tokens as follows:
+<CONTENT_2><CONTENT_3>
+
+"""
+    
+    
+    
+    
+    def _generate_model_layers(self, item, user_cluster, context_items):
+        """使用LLM生成可变层（保持原始逻辑）"""
+        prompt = self._build_generation_prompt(item, user_cluster, context_items)
+        device = self.base_model.device
+        inputs = self.tokenizer(
+            prompt,
+            return_tensors="pt",
+            max_length=512,
+            truncation=True
+        ).to(device)
+        
+        current_temp = self._calculate_temperature()
+        outputs = self.base_model.generate(
+            **inputs,
+            output_hidden_states=True,
+            return_dict_in_generate=True,
+            max_new_tokens=128,
+            temperature=current_temp,
+            top_p=0.9,
+            num_return_sequences=1
+        )
+        
+        generated_ids = outputs.sequences[0]
+        generated_text = self.tokenizer.decode(generated_ids, skip_special_tokens=True)
+        c, d = self._parse_output(generated_text)
+        
+        # 语义验证
+        if not self._validate_semantics(item["description"], f"{c} {d}", context_items):
+            c, d = self._generate_fallback(item, context_items)
+            
+        return c, d
+
+    def _build_generation_prompt(self, item, user_cluster, context_items):
+        """构建生成提示（保持原始逻辑）"""
+        neighbor_info = "、".join([f"{i['title']}（{i['brand']}）" for i in context_items])
+        current_item = (
+            f"标题：{item['title']}\n"
+            f"品牌：{item['brand']}\n"
+            f"分类：{item['categories']}\n"
+            f"描述摘要：{item['description'][:100]}..."
+        )
+        return f"""这是一个【{user_cluster}】的用户，交互项目为【{item['title']}】，
+        交互这个物品的上下文信息为【{neighbor_info}】，
+        请生成该物品的具有两个动态标识符后缀的标识符：
+
+        {current_item}
+
+        请根据用户特征和交互上下文，生成两个动态标识符：
+        1. 用户偏好特征标识符（反映用户兴趣点）：
+        2. 场景关联特征标识符（反映使用场景关联）："""
+
+    def _parse_output(self, text: str) -> Tuple[str, str]:
+        """解析输出（保持原始逻辑）"""
+        pref_pattern = r"用户偏好特征标识符[：:](.+?)\n"
+        scene_pattern = r"场景关联特征标识符[：:](.+?)(\n|$)"
+        
+        pref_match = re.search(pref_pattern, text)
+        scene_match = re.search(scene_pattern, text)
+        
+        pref_text = pref_match.group(1).strip() if pref_match else "default_pref"
+        scene_text = scene_match.group(1).strip() if scene_match else "default_scene"
+        
+        c_hash = hashlib.blake2b(pref_text.encode(), digest_size=8).hexdigest()
+        d_hash = hashlib.blake2b(scene_text.encode(), digest_size=8).hexdigest()
+        
+        return f"<c_{c_hash}>", f"<d_{d_hash}>"
+
+    def _validate_semantics(self, description, identifiers, context):
+        """语义验证（保持原始逻辑）"""
+        desc_embed = self.semantic_validator.encode(description)
+        id_embed = self.semantic_validator.encode(" ".join(identifiers))
+        base_sim = np.dot(desc_embed, id_embed)
+        
+        context_embeds = [
+            self.semantic_validator.encode(ctx["description"]) 
+            for ctx in context
+        ]
+        context_sim = np.mean([
+            np.dot(id_embed, ctx_embed) 
+            for ctx_embed in context_embeds
+        ])
+        
+        total_score = 0.6*base_sim + 0.4*context_sim
+        return total_score > CONFIG["identifier_model"]["semantic_threshold"]
+
+    def _generate_fallback(self, item, context):
+        """回退生成（保持原始逻辑）"""
+        c_hash = hashlib.blake2b(item["description"][:100].encode()).hexdigest()[:4]
+        d_hash = hashlib.blake2b(item["description"][100:200].encode()).hexdigest()[:4]
+        return f"<c_{c_hash}>", f"<d_{d_hash}>"
+
+    def _calculate_temperature(self):
+        """动态温度调度（保持原始逻辑）"""
+        base = CONFIG["identifier_model"]["temperature_schedule"]["base"]
+        max_temp = CONFIG["identifier_model"]["temperature_schedule"]["max"]
+        return base + (max_temp - base) * 0.5
+import re
+from typing import List, Dict, Tuple
+
+class EnhancedRecommender:
+    # """结合用户分类和标识符评估的推荐系统（修改后）"""
+    # def __init__(self, model, tokenizer, items: Dict, mode: str = "inference"):
+    #     self.model = model
+    #     self.tokenizer = tokenizer
+    #     self.items = items
+    #     self.mapper = TwoLayerMapper(items)
+    #     self.mode = mode
+    def __init__(self, mode: str = "inference"):
+        os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
+        # self.items = self._load_items() 
+        # self.mapper = TwoLayerMapper(self.items)
+        # self.identifier_map = self._build_identifier_map()
+
+        self.mode = mode
+        self.items = self._load_items()
+        self.users = self._load_users()
+        self.mapper = TwoLayerMapper(self.items)
+        self.identifier_map = self._build_identifier_map()
+        
+        self.bnb_config = BitsAndBytesConfig(
+            load_in_4bit=True,
+            bnb_4bit_use_double_quant=True,
+            bnb_4bit_quant_type="nf4",
+            bnb_4bit_compute_dtype=torch.float16
+        )
+        
+        # 模型加载
+        self.model = AutoModelForCausalLM.from_pretrained(
+            CONFIG["model_name"],
+            quantization_config=self.bnb_config,
+            device_map="auto",
+            torch_dtype=torch.float16
+        )
+        # 初始化模型和tokenizer
+        self.tokenizer = AutoTokenizer.from_pretrained(
+            CONFIG["model_name"],
+            padding_side="right",
+            use_fast=True
+        )
+        # self.tokenizer = AutoTokenizer.from_pretrained(
+        #     CONFIG["model_name"],
+        #     padding_side="right",
+        #     use_fast=True,
+        # )
+        
+        # 确保 pad_token 存在
+        if self.tokenizer.pad_token is None:
+            self.tokenizer.pad_token = self.tokenizer.eos_token
+            self.tokenizer.pad_token_id = self.tokenizer.eos_token_id
+        print("\n[初始化验证] Tokenizer配置:")
+        print(f" - pad_token: {self.tokenizer.pad_token}")
+        print(f" - pad_token_id: {self.tokenizer.pad_token_id}")
+        print(f" - eos_token_id: {self.tokenizer.eos_token_id}")
+        
+        self.mode = mode
+        self.bnb_config = BitsAndBytesConfig(
+            load_in_8bit=True,
+            llm_int8_enable_fp32_cpu_offload=True
+        )
+        
+        # 加载静态标识符（新增）
+        with open(CONFIG["static_identifiers_json"], 'r', encoding='utf-8-sig') as f:
+            self.static_identifiers = json.load(f)
+            # 转换键为字符串类型（确保与商品ID匹配）
+            self.static_identifiers = {str(k): v for k, v in self.static_identifiers.items()}
+        torch.cuda.empty_cache()
+        if mode == "train":
+            self.model = AutoModelForCausalLM.from_pretrained(
+                CONFIG["model_name"],
+                quantization_config=None,
+                torch_dtype=torch.float16
+            )
+            
+            # 关键修改：添加多GPU支持
+            if torch.cuda.device_count() > 1:
+                print(f"使用 {torch.cuda.device_count()} 块GPU进行训练")
+                self.model = nn.DataParallel(self.model)
+            
+            self.model = self.model.to('cuda')
+            
+            # self.model.config.pad_token_id = self.tokenizer.pad_token_id
+            # self.model.config.eos_token_id = self.tokenizer.eos_token_id
+            # self.model.resize_token_embeddings(len(self.tokenizer))
+            # self.model.model.embed_tokens.padding_idx = self.tokenizer.pad_token_id
+            
+            # 添加QLoRA适配器
+            from peft import get_peft_model, LoraConfig
+            model_for_peft = self.model.module if isinstance(self.model, nn.DataParallel) else self.model
+            peft_config = LoraConfig(**CONFIG["lora_config"])
+            self.model = get_peft_model(model_for_peft, peft_config)  # 传入原始模型
+            
+            
+        else:
+            self.model = AutoModelForCausalLM.from_pretrained(
+                CONFIG["model_name"],
+                quantization_config=self.bnb_config,
+                device_map="auto",
+                torch_dtype=torch.float16
+            )
+            self.model.config.pad_token_id = self.tokenizer.pad_token_id
+            self.model.config.eos_token_id = self.tokenizer.eos_token_id
+            self.model.resize_token_embeddings(len(self.tokenizer))
+            self.model.model.embed_tokens.padding_idx = self.tokenizer.pad_token_id
+        self._model = self.model.module if isinstance(self.model, nn.DataParallel) else self.model
+        print(f"[验证] tokenizer.pad_token_id = {self.tokenizer.pad_token_id}")
+        print(f"[验证] model.config.pad_token_id = {self.model.config.pad_token_id}")
+        
+        self.id_generator = ModelDrivenIdentifierGenerator(
+            self.model, 
+            self.tokenizer,
+            self.static_identifiers # 传递静态标识符字典
+        )
+        
+        self.items = self._load_items()
+        self.users = self._load_users()
+        self.train_users, self.test_users = self._split_users()
+        self.identifier_map = self._build_identifier_map()
+
+    def train_with_instructions(self):
+        """执行指令微调的核心方法"""
+        print("\n===== 开始指令微调 =====")
+        
+        # 1. 构建指令数据集
+        print("构建指令数据集...")
+        dataset_builder = InstructionDatasetBuilder(self.users, self.items)
+        instruction_dataset = dataset_builder.build_dataset()
+        
+        if not instruction_dataset:
+            raise ValueError("指令数据集为空，请检查数据加载和处理逻辑")
+        
+        print(f"构建指令数据集完成，共 {len(instruction_dataset)} 个样本")
+        
+        # 2. 初始化微调器
+        print("初始化微调器...")
+        tuner = InstructionFineTuner(self.model, self.tokenizer)
+        
+        # 3. 执行微调
+        print("开始微调...")
+        tuned_model = tuner.apply_fine_tuning(instruction_dataset)
+        
+        # 4. 更新模型
+        self.model = tuned_model
+        print("指令微调完成，模型已更新")
+        
+        # 5. 保存微调后的模型
+        save_path = f"{CONFIG['checkpoint_dir']}_instruction_tuned"
+        print(f"保存微调模型到: {save_path}")
+        self.model.save_pretrained(save_path)
+        self.tokenizer.save_pretrained(save_path)
+
+    
+    
+    def train_identifiers(self):
+        """训练标识符生成模型（保持原始逻辑）"""
+        dataset = IdentifierDataset(
+            users=self.users,
+            items=self.items,
+            id_generator=self.id_generator,
+            base_model=self.model,
+            tokenizer=self.tokenizer,
+            static_identifiers=self.static_identifiers,
+            num_variants=CONFIG["identifier_model"]["num_variants"]
+        )
+        
+        dataloader = DataLoader(dataset, batch_size=8, shuffle=True, collate_fn=lambda x: x)
+        optimizer = torch.optim.AdamW(self.model.parameters(), lr=CONFIG["learning_rate"])
+        accumulation_steps = 4
+        progress_bar = tqdm(range(CONFIG["train_epochs"]))
+        
+        for epoch in range(CONFIG["train_epochs"]):
+            total_loss = 0
+            self.model.train()
+            for i, batch in enumerate(dataloader):
+                # 分别编码输入和目标
+                batch_inputs = [item["input"] for item in batch]
+                batch_targets = [item["target"] for item in batch]
+                
+                # 编码输入（修复点1：确保使用相同的padding和truncation）
+                input_encoding = self.tokenizer(
+                    batch_inputs,
+                    return_tensors="pt",
+                    padding="max_length",
+                    truncation=True,
+                    max_length=256,
+                    return_attention_mask=True
+                ).to(self.model.device)
+                
+                # 编码目标（修复点2：单独编码目标文本）
+                target_encoding = self.tokenizer(
+                    batch_targets,
+                    return_tensors="pt",
+                    padding="max_length",
+                    truncation=True,
+                    max_length=256,
+                    return_attention_mask=True
+                ).to(self.model.device)
+                
+                # 创建标签（修复点3：正确设置labels）
+                labels = target_encoding.input_ids.clone()
+                labels[labels == self.tokenizer.pad_token_id] = -100
+                
+                # 确保输入和标签维度一致
+                if input_encoding.input_ids.size(0) != labels.size(0):
+                    raise ValueError(
+                        f"批处理大小不匹配: 输入{input_encoding.input_ids.size(0)} vs 标签{labels.size(0)}"
+                    )
+                
+                # 模型前向传播
+                outputs = self.model(
+                    input_ids=input_encoding.input_ids,
+                    attention_mask=input_encoding.attention_mask,
+                    labels=labels,
+                    output_hidden_states=True
+                )
+                
+                task_loss = outputs.loss
+                diversity_loss = self.id_generator.diversity_loss(outputs.hidden_states[-1])
+                total_loss += (task_loss + diversity_loss).item()
+                
+                (task_loss + diversity_loss).backward()
+                if (i + 1) % accumulation_steps == 0:
+                    optimizer.step()
+                    optimizer.zero_grad()
+            
+            progress_bar.update(1)
+            print(f"Epoch {epoch+1} | Loss: {total_loss/len(dataloader):.4f}")
+        
+        self.model.save_pretrained(CONFIG["checkpoint_dir"] + "_identifier")
+
+  
+    def _build_train_prompt(self, cluster: Dict, context: List[str], target_item_id: str) -> str:
+        """构建训练提示模板（修复版本）
+        
+        参数:
+            cluster: 用户分类信息字典
+            context: 上下文交互物品ID列表
+            target_item_id: 目标物品ID
+        """
+        # 获取目标物品信息
+        target_item = self.items[target_item_id]
+        
+        # 获取上下文物品信息
+        context_items = [self.items[item_id] for item_id in context if item_id in self.items]
+        
+        # 构建上下文标识符字符串
+        context_ids = [" ".join(item["identifiers"]) for item in context_items]
+        context_str = " ".join(context_ids)
+        
+        # 获取用户类型描述
+        cluster_desc = self._get_cluster_desc(cluster)
+        
+        return (
+            f"这是个【{cluster_desc}】的用户，"
+            f"近期交互历史项目的完整标识符为【{context_str}】，"
+            f"商品标题：{target_item['title']}\n"
+            f"品牌：{target_item['brand']}\n"
+            f"分类：{target_item['categories']}\n"
+            "请生成该商品的技术特征和使用场景特征："
+        )
+
+
+    def train(self):
+        """基于用户交互历史进行指令微调（保持原始逻辑）"""
+        optimizer = torch.optim.AdamW(self.model.parameters(), lr=CONFIG["learning_rate"])
+        loss_fn = torch.nn.CrossEntropyLoss()
+        
+        train_samples = []
+        for uid, user in self.train_users.items():
+            interactions = user["interacted_items"]
+            if len(interactions) < CONFIG["history_length"] + 1:
+                continue
+            
+            for i in range(len(interactions) - CONFIG["history_length"]):
+                context = interactions[i:i+CONFIG["history_length"]+1]
+                target = interactions[i+CONFIG["history_length"]]
+                
+                # prompt = self._build_train_prompt(user["cluster"], context)
+                
+                prompt = self._build_train_prompt(
+                    cluster=user["cluster"],
+                    context=context,
+                    target_item_id=target
+                )
+                    
+                target_text = " ".join(self.items[target]["identifiers"])
+                
+                train_samples.append((prompt, target_text))
+        
+        # print("\n[数据验证] 样本编码检查:")
+        sample_prompt, sample_target = train_samples[0]
+        sample_encoding = self.tokenizer(
+            sample_prompt + " " + sample_target,
+            padding="max_length",
+            truncation=True,
+            max_length=512 + 128,
+            return_tensors="pt"
+        )
+        # print(f"Input IDs shape: {sample_encoding['input_ids'].shape}")
+        # print(f"Attention Mask: {sample_encoding['attention_mask'].tolist()}")
+        # print(f"Pad Token位置: {(sample_encoding['input_ids'] == self.tokenizer.pad_token_id).nonzero()}")
+        
+        self.model.train()
+        for epoch in range(CONFIG["train_epochs"]):
+            total_loss = 0
+            for prompt, target in train_samples:
+                full_text = f"{prompt} {target}"
+                encoding = self.tokenizer(
+                    full_text,
+                    max_length=512 + 128,
+                    padding="max_length",
+                    truncation=True,
+                    return_tensors="pt"
+                )
+                
+                prompt_encoding = self.tokenizer(
+                    prompt,
+                    add_special_tokens=False,
+                    return_tensors="pt"
+                )
+                prompt_length = prompt_encoding.input_ids.size(1)
+                
+                labels = encoding.input_ids.clone()
+                labels = torch.where(
+                    encoding.input_ids == self.tokenizer.pad_token_id,
+                    -100,
+                    labels
+                )
+                labels[:, :prompt_length] = -100
+                
+                inputs = {
+                    "input_ids": encoding.input_ids.to(self.model.device),
+                    "attention_mask": encoding.attention_mask.to(self.model.device),
+                    "labels": labels.to(self.model.device)
+                }
+                
+                outputs = self.model(**inputs)
+                loss = outputs.loss
+                
+                optimizer.zero_grad()
+                loss.backward()
+                optimizer.step()
+                
+                total_loss += loss.item()
+            
+            print(f"Epoch {epoch+1} Loss: {total_loss/len(train_samples):.4f}")
+        
+        self.model.save_pretrained(CONFIG["checkpoint_dir"])
+        self.tokenizer.save_pretrained(CONFIG["checkpoint_dir"])
+
+    def _load_items(self) -> Dict:
+        """加载商品数据（修复后）"""
+        with open(CONFIG["items_json"], 'r', encoding='utf-8-sig') as f:
+            data = json.load(f)
+        
+        # 验证顶层结构
+        required_fields = ["brand", "categories", "description", "title"]  # 明确要求必须包含description
+        for item_id, item in data.items():
+            if not isinstance(item, dict):
+                raise ValueError(f"商品 {item_id} 数据格式错误，应为字典")
+            
+            # 检查必填字段（新增对description的严格校验）
+            missing = [field for field in required_fields if field not in item]
+            if missing:
+                raise ValueError(f"商品 {item_id} 缺少必要字段: {missing}")
+            
+            # 确保description非空（关键修复点）
+            if not isinstance(item["description"], str) or len(item["description"].strip()) == 0:
+                item["description"] = ""  # 空描述时设为空字符串，避免哈希计算失败
+                # print(f"警告：商品 {item_id} 的description字段为空，已设为空字符串")
+        
+        # 生成description_hash（确保每个item都有该字段）
+        for item_id, item in data.items():
+            try:
+                # 使用description生成哈希（即使description为空也能计算）
+                description = item["description"].encode()
+                item["description_hash"] = hashlib.blake2b(
+                    description,
+                    digest_size=16
+                ).hexdigest()
+            except Exception as e:
+                # 异常时生成固定哈希（避免KeyError）
+                item["description_hash"] = "fallback_hash_123456"  # 固定备用值
+                print(f"警告：商品 {item_id} 计算description_hash失败，使用备用值: {e}")
+        
+        # 添加id字段（与JSON文件键匹配）
+        for item_id, item in data.items():
+            item["id"] = str(item_id)  # 确保id为字符串类型
+        
+        print("商品数据加载完成，所有商品均已生成description_hash")
+        return data
+
+    def _load_users(self) -> Dict:
+        """加载用户数据（保持原始逻辑）"""
+        with open(CONFIG["users_json"], 'r') as f:
+            data = json.load(f)
+            
+        required_fields = ["interacted_items", "cluster"]
+        for uid, user in data.items():
+            if not all(field in user for field in required_fields):
+                raise ValueError(f"用户 {uid} 数据格式错误")
+            user["interacted_items"] = [str(i) for i in user["interacted_items"]]
+            
+        return data
+
+ 
+    # def _build_identifier_map(self) -> Dict:
+    #     """
+    #     构建仅使用前两层标识符的映射关系
+    #     返回格式: {"<a_123> <b_456>": "item_id"}
+    #     """
+    #     mapping = {}
+    #     for item_id, item in self.items.items():
+    #         if 'identifiers' not in item or len(item['identifiers']) < 1:
+    #             print(f"警告：商品 {item_id} 缺少足够标识符，跳过")
+    #             continue
+                
+    #         # 只提取前两层标识符作为键
+    #         ab_key = " ".join(item["identifiers"][:2])
+    #         mapping[ab_key] = item_id
+        
+    #     print(f"[调试] 标识符映射示例（前两层）: {list(mapping.items())[:3]}")
+    #     return mapping
+    def _build_identifier_map(self) -> Dict:
+        """重建标识符映射关系"""
+        return {
+            " ".join(item["identifiers"][:2]): item_id 
+            for item_id, item in self.items.items()
+            if "identifiers" in item and len(item["identifiers"]) >= 2
+        }
+    
+    def _split_users(self) -> Tuple[Dict, Dict]:
+        """划分训练/测试用户（保持原始逻辑）"""
+        user_list = list(self.users.items())
+        split_idx = int(len(user_list) * (1 - CONFIG["test_ratio"]))
+        return dict(user_list[:split_idx]), dict(user_list[split_idx:])
+
+    def evaluate(self):
+        """执行评估流程（确保使用微调后的模型）"""
+        # === 新增修改点1：模型状态验证 ===
+        print(f"[验证] 评估使用的模型类型: {type(self.model)}")
+        if hasattr(self.model, 'module'):  # 多GPU情况
+            print(f"[验证] 实际模型类: {type(self.model.module)}")
+        else:
+            print(f"[验证] 实际模型类: {type(self.model)}")
+        
+        # === 修改点2：确保使用微调后的模型 ===
+        if not hasattr(self, '_is_tuned'):
+            print("警告：评估前未进行指令微调，将自动执行微调")
+            self.train_with_instructions()
+        
+        results = []
+        total_hits = 0
+        total_ndcg = 0
+        valid_users = 0
+        
+        # === 修改点3：添加模型模式切换 ===
+        self.model.eval()  # 确保模型在评估模式
+        with torch.no_grad():  # 禁用梯度计算
+            for user_id, user_data in self.test_users.items():
+                interactions = user_data["interacted_items"]
+                if len(interactions) <= CONFIG["history_length"]:
+                    continue
+                    
+                context = interactions[:CONFIG["history_length"]]
+                ground_truth_id = interactions[CONFIG["history_length"]]   #格式为item_id
+                
+                target_item_id = interactions[CONFIG["history_length"]]
+                target_item = self.items[target_item_id] 
+                ground_truth = " ".join(target_item["identifiers"][:2])  # 格式: "<a_xxx> <b_xxx>" 
+                print("///////////////////////////////////////")
+                print(target_item["identifiers"]) 
+                print(target_item["identifiers"][:2]) 
+                print("///////////////////////////////////////")
+                # === 修改点4：使用微调后的生成方法 ===
+                recommendation, identifiers = self._generate_with_tuned_model(
+                    user_data["cluster"], 
+                    context
+                )
+                
+                hit = self._calculate_hit(ground_truth, recommendation)
+                ndcg = self._calculate_ndcg(ground_truth, recommendation)
+                
+                total_hits += hit
+                total_ndcg += ndcg
+                valid_users += 1
+                
+                results.append({
+                    "user_id": user_id,
+                    "staticpart_identifiers": identifiers,
+                    "recommendations_remove_dynamic_id": recommendation,
+                    "ground_truth": ground_truth,
+                    "ground_truth_id": ground_truth_id,
+                    "hit": hit,
+                    "ndcg": ndcg
+                })
+        
+        metrics = {
+            "hit@5": total_hits / valid_users if valid_users > 0 else 0,
+            "ndcg@5": total_ndcg / valid_users if valid_users > 0 else 0,
+            "total_users": len(self.test_users),
+            "valid_users": valid_users
+        }
+        self._save_output(results, metrics)
+        return metrics
+    
+    def _generate_with_tuned_model(self, cluster: Dict, context: List[str]) -> Tuple[List[str], List[str]]:
+        """使用微调后的模型生成推荐"""
+        # === 修改点5：构建微调专用提示 ===
+        prompt = self._build_tuned_prompt(cluster, context)
+        
+        # === 修改点6：使用微调生成逻辑 ===
+        generated = self._safe_generate(prompt)
+        recommendations = self._parse_output(generated)
+        
+        # === 修改点7：获取上下文标识符 ===
+        context_ids = []
+        for item_id in context:
+            if item_id in self.items:
+                identifiers = self.items[item_id].get("identifiers", [])
+                if len(identifiers) >= 2:
+                    context_ids.append(" ".join(identifiers[:2]))
+        
+        return recommendations, context_ids
+    
+    def _build_tuned_prompt(self, cluster: Dict, context: List[str]) -> str:
+        """构建微调专用提示词"""
+        context_items = [self.items[item_id] for item_id in context if item_id in self.items]
+        context_str = "\n".join(
+            f"{i+1}. {' '.join(item['identifiers'][:2])}" 
+            for i, item in enumerate(context_items)
+        )
+        
+        return f"""基于微调后的模型生成推荐：
+用户画像: {self._get_cluster_desc(cluster)}
+近期交互标识符（前两层）:
+{context_str}
+请生成接下来最可能交互的{CONFIG['top_k']}个商品标识符（只需前两层）:
+1."""
+
+    # def _calculate_hit(self, target_item_id: str, recommendations: List[str]) -> int:
+    #     """计算hit@5（基于前两位标识符匹配）"""
+    #     if target_item_id not in self.items:
+    #         return 0
+            
+    #     target_item = self.items[target_item_id]
+    #     target_identifiers = target_item.get("identifiers", [])
+        
+    #     if len(target_identifiers) < 2:
+    #         return 0
+            
+    #     target_prefix = " ".join(target_identifiers[:2])
+        
+    #     for rec_id in recommendations[:CONFIG["top_k"]]:
+    #         if rec_id not in self.items:
+    #             continue
+                
+    #         rec_item = self.items[rec_id]
+    #         rec_identifiers = rec_item.get("identifiers", [])
+            
+    #         if len(rec_identifiers) >= 2 and " ".join(rec_identifiers[:2]) == target_prefix:
+    #             return 1
+                
+    #     return 0
+
+    # def _calculate_ndcg(self, target_item_id: str, recommendations: List[str]) -> float:
+    #     """计算NDCG@5（基于前两位标识符匹配）"""
+    #     if target_item_id not in self.items:
+    #         return 0.0
+            
+    #     target_item = self.items[target_item_id]
+    #     target_identifiers = target_item.get("identifiers", [])
+        
+    #     if len(target_identifiers) < 2:
+    #         return 0.0
+            
+    #     target_prefix = " ".join(target_identifiers[:2])
+        
+    #     for rank, rec_id in enumerate(recommendations[:CONFIG["top_k"]], 1):
+    #         if rec_id not in self.items:
+    #             continue
+                
+    #         rec_item = self.items[rec_id]
+    #         rec_identifiers = rec_item.get("identifiers", [])
+            
+    #         if len(rec_identifiers) >= 2 and " ".join(rec_identifiers[:2]) == target_prefix:
+    #             return 1.0 / np.log2(rank + 1)
+                
+    #     return 0.0
+    
+    def _calculate_hit(self, ground_truth: str, recommendations: List[str]) -> int:
+        """计算hit@5（基于前两位标识符匹配）"""
+        for rec_id in recommendations[:CONFIG["top_k"]]:
+            # if rec_id not in self.items:
+            #     continue
+                
+            # rec_item = self.items[rec_id]
+            # if "identifiers" not in rec_item or len(rec_item["identifiers"]) < 2:
+            #     continue
+                
+            # rec_prefix = " ".join(rec_item["identifiers"][:2])
+            print("qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqq")
+            print(rec_id)
+            print(ground_truth)
+            print("qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqq")
+            if rec_id == ground_truth:
+                return 1
+            # if rec_prefix == ground_truth:
+            #     return 1
+        return 0
+
+    def _calculate_ndcg(self, ground_truth: str, recommendations: List[str]) -> float:
+        """计算NDCG@5（基于前两位标识符匹配）"""
+        for rank, rec_id in enumerate(recommendations[:CONFIG["top_k"]], 1):
+            # if rec_id not in self.items:
+            #     continue
+                
+            # rec_item = self.items[rec_id]
+            # if "identifiers" not in rec_item or len(rec_item["identifiers"]) < 2:
+            #     continue
+                
+            # rec_prefix = " ".join(rec_item["identifiers"][:2])
+            
+            if rec_id == ground_truth:
+                return 1.0 / np.log2(rank + 1)
+            # if rec_prefix == ground_truth:
+            #     return 1.0 / np.log2(rank + 1)
+        return 0.0
+
+    def generate_recommendation(self, cluster: Dict, context: List[str]) -> Tuple[List[str], List[str]]:
+        """生成推荐的核心方法（带调试输出）"""
+        # 1. 准备上下文标识符
+        context_ids = []
+        for item_id in context:
+            if item_id in self.items:
+                identifiers = self.items[item_id].get("identifiers", [])
+                if len(identifiers) >= 2:
+                    context_ids.append(" ".join(identifiers[:2]))
+        
+        print("\n=== 调试信息 ===")
+        print("上下文标识符:", context_ids)
+        
+        # 2. 构建更明确的提示词
+        prompt = self._build_improved_prompt(cluster, context_ids)
+        print("生成的提示词:", prompt)
+        
+        # 3. 调用模型生成
+        generated = self._safe_generate(prompt)
+        print("模型原始输出:", generated)
+        
+        # 4. 解析推荐结果
+        recommendations = self._parse_output_with_debug(generated)
+        print("解析后的推荐:", recommendations)
+        
+        return recommendations, context_ids
+    
+    def _build_improved_prompt(self, cluster: Dict, context_ids: List[str]) -> str:
+        """修复版提示词模板（避免f-string中的反斜杠问题）"""
+        # 构建上下文行列表
+        context_lines = [f"{i+1}. {ids}" for i, ids in enumerate(context_ids)]
+        
+        # 使用显式换行符连接字符串
+        return (
+            "你是一个商品推荐系统，请根据用户特征和历史交互生成推荐。\n"
+            f"用户特征: {self._get_cluster_desc(cluster)}\n"
+            "近期交互商品标识符（前两层）:\n"
+            f"{chr(10).join(context_lines)}\n"  # 使用chr(10)替代\n
+            "请严格按照以下格式输出推荐结果（只需前两层标识符）：\n"
+            "1. <a_xxx> <b_xxx>\n"
+            "2. <a_xxx> <b_xxx>\n"
+            "3. <a_xxx> <b_xxx>\n"
+            "请确保输出真实存在的标识符，不要使用占位符(x):\n"
+            "1."
+        )
+        
+    def _parse_output_with_debug(self, text: str) -> List[str]:
+        """带调试信息的解析方法"""
+        if not text.strip():
+            print("警告：模型返回空文本")
+            return []
+        
+        # 尝试多种匹配模式
+        patterns = [
+            r"\d+\. (\<a_\w+\> \<b_\w+\>)",  # 标准格式
+            r"\<a_\w+\> \<b_\w+\>",          # 无序号格式
+            r"推荐.*?(\<a_\w+\> \<b_\w+\>)"   # 自然语言引导
+        ]
+        
+        recommendations = []
+        for pattern in patterns:
+            matches = re.findall(pattern, text)
+            if matches:
+                print(f"匹配到模式: {pattern} -> {matches}")
+                for ab_pair in matches:
+                    item_id = self.mapper.get_item_id(ab_pair)
+                    if item_id:
+                        recommendations.append(item_id)
+                    else:
+                        print(f"未找到映射: {ab_pair}")
+                break
+        
+        return recommendations[:CONFIG["top_k"]]
+    
+    # def generate_recommendation(self, cluster: Dict, context: List[str]) -> Tuple[List[str], List[str]]:
+    #     """
+    #     生成推荐的核心方法（使用前两层标识符）
+    #     返回: (推荐商品ID列表, 上下文标识符列表)
+    #     """
+    #     # 1. 准备上下文标识符（确保有效性）
+    #     context_ids = []
+    #     for item_id in context:
+    #         if item_id in self.items and len(self.items[item_id].get("identifiers", [])) >= 2:
+    #             context_ids.append(" ".join(self.items[item_id]["identifiers"][:2]))
+        
+    #     # 2. 构建更明确的提示词
+    #     prompt = self._build_improved_prompt(cluster, context_ids)
+        
+    #     # 3. 生成推荐（添加调试输出）
+    #     generated = self._safe_generate(prompt)
+    #     print(f"[DEBUG] 模型生成内容:\n{generated}")  # 关键调试点
+        
+    #     # 4. 解析推荐结果（更宽松的匹配）
+    #     recommendations = self._parse_output(generated)
+    #     print(f"[DEBUG] 解析结果: {recommendations}")
+        
+    #     return recommendations, context_ids
+
+    def _build_prompt(self, cluster, context_ids):
+        """构建用户上下文提示模板（保持原始逻辑）"""
+        cluster_desc = self._get_cluster_desc(cluster)
+        
+        context_str = "\n".join(
+            f"[Interaction {i+1}]: {' '.join(ids)}" 
+            for i, ids in enumerate(context_ids)
+        )
+        
+        return f"""基于用户特征和交互历史生成后续推荐：
+        
+        # 用户画像
+        {cluster_desc}
+
+        # 近期交互标识符
+        {context_str}
+
+        # 推荐需求
+        请生成接下来最符合该用户兴趣的{CONFIG["top_k"]}个商品标识符，按相关性降序排列：
+
+        1."""
+
+    def _build_prompt1(self, cluster, context_ids):
+        """新提示模板实现（保持原始逻辑）"""
+        cluster_desc = self._get_cluster_desc(cluster)
+        
+        context_str = "\n".join(
+            [f"历史{i+1}: {' '.join(ids)}" 
+            for i, ids in enumerate(context_ids)]
+        )
+        return (
+            f"这是个【{cluster_desc}】的用户，"
+            f"近期交互历史项目的完整标识符为【{context_str}】，"
+            f"请生成接下来最符合该用户兴趣的 {CONFIG['top_k']} 个商品标识符,按相关性降序排列,格式为：\n"
+        "1. <a_xxxxxxxx> <b_xxxxxxxx> <c_xxxx> <d_xxxx>\n"
+        "2. <a_xxxxxxxx> <b_xxxxxxxx> <c_xxxx> <d_xxxx>\n"
+        "3. ..."
+            f"\n请生成具体的标识符，而不是占位符(x):\n"
+            "1."
+        )
+
+    def _get_cluster_desc(self, cluster):
+        """获取用户类型描述文本（保持原始逻辑）"""
+        stage_key = (
+            cluster.get("stage1", 0),
+            cluster.get("stage2", 0),
+            cluster.get("final", 0)
+        )
+        desc_map = {
+            (0,1,1): "专业音频工程师用户群体，关注设备的技术参数和信号保真度",
+            (1,0,2): "入门级音乐创作者，偏好设备的易用性和性价比",
+            (1,1,3): "有个性的音乐爱好者，喜欢比较独特的乐器"
+        }
+        return desc_map.get(stage_key, "普通音频设备用户")
+
+
+    def _safe_generate(self, prompt: str) -> str:
+        """安全的生成方法（带错误处理）"""
+        try:
+            inputs = self.tokenizer(
+                prompt,
+                return_tensors="pt",
+                max_length=1024,
+                truncation=True
+            ).to(self.model.device)
+            
+            outputs = self.model.generate(
+                **inputs,
+                max_new_tokens=200,
+                temperature=0.7,
+                do_sample=True
+            )
+            return self.tokenizer.decode(outputs[0], skip_special_tokens=True)
+        except Exception as e:
+            print(f"生成时出错: {str(e)}")
+            return "<a_default> <b_default>"  # 返回默认值避免空结果
+    
+    # def _safe_generate(self, prompt):
+    #     """安全生成控制（保持原始逻辑）"""
+    #     try:
+    #         inputs = self.tokenizer(
+    #             prompt,
+    #             return_tensors="pt",
+    #             max_length=1024,
+    #             truncation=True,
+    #             padding=True
+    #         ).to(self.model.device)
+            
+    #         outputs = self.model.generate(
+    #             **inputs,
+    #             max_new_tokens=300,
+    #             temperature=0.7,
+    #             top_p=0.9,
+    #             num_return_sequences=1,
+    #             pad_token_id=self.tokenizer.pad_token_id,
+    #             eos_token_id=self.tokenizer.eos_token_id
+    #         )
+            
+    #         return self.tokenizer.decode(outputs[0], skip_special_tokens=True)
+    #     except Exception as e:
+    #         print(f"生成失败: {str(e)}")
+    #         return "1. <a_default> <b_default>"  # 返回默认值避免空结果    
+        
+        
+        # try:
+        #     generation_config = {
+        #         "max_new_tokens": 300,
+        #         "temperature": 0.3,
+        #         "top_p": 0.85,
+        #         "repetition_penalty": 1.2,
+        #         "num_beams": 3,
+        #         "early_stopping": True
+        #     }
+        #     inputs = self.tokenizer(
+        #         prompt,
+        #         return_tensors="pt",
+        #         max_length=1024,
+        #         truncation=True,
+        #         padding=True
+        #     ).to(self.model.device)
+            
+        #     outputs = self.model.generate(
+        #         **inputs,
+        #         output_hidden_states=True,
+        #         return_dict_in_generate=True,
+        #         max_new_tokens=CONFIG["max_new_tokens"],
+        #         temperature=0.3,
+        #         repetition_penalty=1.2,
+        #         num_beams=3,
+        #         top_p=0.95,
+        #         do_sample=True,
+        #         pad_token_id=self.tokenizer.pad_token_id,
+        #         eos_token_id=self.tokenizer.eos_token_id
+        #     )
+            
+        #     if isinstance(outputs[0], list):
+        #         token_ids = outputs[0][0]
+        #     else:
+        #         token_ids = outputs[0]
+            
+        #     if isinstance(token_ids, torch.Tensor):
+        #         token_ids = token_ids.tolist()
+            
+        #     if isinstance(token_ids, list) and any(isinstance(i, list) for i in token_ids):
+        #         token_ids = [item for sublist in token_ids for item in sublist]
+            
+        #     return self.tokenizer.decode(token_ids, skip_special_tokens=True)
+        # except RuntimeError as e:
+        #     if "CUDA out of memory" in str(e):
+        #         torch.cuda.empty_cache()
+        #         return ""
+        #     raise
+
+    def _parse_output(self, text: str) -> List[str]:
+        """改进的解析方法，支持多种格式"""
+        # 方案1：匹配标准格式 "1. <a_xxx> <b_xxx>"
+        pattern1 = re.compile(r"\d+\. (\<a_\w+\> \<b_\w+\>)")
+        # 方案2：匹配松散格式 "<a_xxx> <b_xxx>"
+        pattern2 = re.compile(r"(\<a_\w+\> \<b_\w+\>)")
+        
+        matches = []
+        # 尝试第一种匹配
+        matches = pattern1.findall(text)
+        if not matches:
+            # 尝试第二种匹配
+            matches = pattern2.findall(text)
+        
+        recommendations = []
+        for ab_pair in matches:
+            # print("/*/*/*/*/*/--+++/-/++++++++--***--*-*-*-*-*-*-*-*-*-*-**-")
+            recommendations.append(ab_pair)
+            if ab_pair in self.identifier_map:
+                recommendations.append(self.identifier_map[ab_pair])
+                recommendations.append(ab_pair)
+                print("推荐结果测试①：{recommendations}")
+                print(recommendations)
+            if len(recommendations) >= CONFIG["top_k"]:
+                break
+                
+        return recommendations
+
+    def _save_output(self, results: List[Dict], metrics: Dict):
+        """修复版结果保存方法（自动创建目录）"""
+        output_dir = Path(CONFIG["output_dir"])
+        
+        # 修复点1：确保输出目录存在
+        output_dir.mkdir(parents=True, exist_ok=True)
+        
+        timestamp = int(time.time())
+        details_path = output_dir / f"details_{timestamp}.json"
+        metrics_path = output_dir / f"metrics_{timestamp}.json"
+        
+        # 修复点2：使用更安全的文件写入方式
+        try:
+            with open(details_path, 'w', encoding='utf-8') as f:
+                json.dump({
+                    "config": CONFIG,
+                    "results": results
+                }, f, indent=2, ensure_ascii=False)
+            
+            with open(metrics_path, 'w', encoding='utf-8') as f:
+                json.dump(metrics, f, indent=2)
+                
+        except OSError as e:
+            print(f"文件保存失败: {str(e)}")
+            # 修复点3：失败时尝试使用备用路径
+            backup_dir = Path("./backup_results")
+            backup_dir.mkdir(exist_ok=True)
+            
+            with open(backup_dir/f"details_{timestamp}.json", 'w') as f:
+                json.dump({"error": str(e), "original_path": str(details_path)}, f)
+                
+            raise RuntimeError(f"无法写入结果文件，已保存到备用目录: {backup_dir}")
+
+
+    
+    def _generate_layer(self, prefix: str, base: str, prev_hash: str = "", salt: str = "") -> str:
+        """生成单个层次标识符（保持原始逻辑）"""
+        hash_seed = f"{prev_hash}{base}{salt}".encode()
+        hash_bytes = hashlib.blake2b(
+            hash_seed,
+            digest_size=8,
+            key=prefix.encode()
+        ).digest()
+        hash_hex = hash_bytes.hex()[:8]
+        return f"<{prefix}_{hash_hex}>"
+
+if __name__ == "__main__":
+    # 配置校验
+    assert Path(CONFIG["items_json"]).exists(), "商品数据文件不存在"
+    assert Path(CONFIG["users_json"]).exists(), "用户数据文件不存在"
+    assert Path(CONFIG["static_identifiers_json"]).exists(), "静态标识符文件不存在"
+    
+    try:
+        # 预训练标识符生成器
+        print("预训练标识符生成模型...")
+        recommender = EnhancedRecommender(mode="train")
+        recommender.train_identifiers()    
+        
+        # 微调推荐模型
+        print("微调推荐模型...")
+        recommender.train()
+        recommender.train_with_instructions()  
+        # 评估
+        print("开始评估...")
+        metrics = recommender.evaluate()
+        
+        print(
+            "评估完成：\n"
+            f"Hit@5: {metrics['hit@5']:.4f}\n"
+            f"NDCG@5: {metrics['ndcg@5']:.4f}\n"
+            f"有效用户数: {metrics['valid_users']}/{metrics['total_users']}"
+        )
+    except Exception as e:
+        print(f"系统运行时发生错误：{str(e)}")
+        raise
+    
