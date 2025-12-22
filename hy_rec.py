@@ -1,4 +1,3 @@
-#动态的修改
 import os
 os.environ['TRITON_PTXAS_PATH'] = ''
 os.environ["TORCH_LIBRARY_ALLOW_DUPLICATE_REGISTRATION"] = "1"
