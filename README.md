@@ -1,3 +1,18 @@
 For the acquisition of static identifiers, you can refer to representative works: [TIGER](https://github.com/EdoardoBotta/RQ-VAE-Recommender) and [LETTER](https://github.com/HonghuiBao2000/LETTER.)
 
-pip install -r requirements.txt
+Requirement：
+torch==2.7.1+cu118
+accelerate
+tokenizers
+sentencepiece
+deepspeed
+evaluate
+peft
+bitsandbytes
+tqdm
+transformers...
+
+
+cd LocHy-GenRec
+python -u ".../.py"
+python -u ".../hy-genrec.py"
