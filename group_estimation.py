@@ -1,9 +1,3 @@
-
-"""
-整合用户交互与商品元数据的完整系统
-数据集结构适配版本
-"""
-
 import json
 import torch
 import numpy as np
