@@ -39,4 +39,6 @@ python -u ".../group_estimation.py"
 python -u ".../hy_genrec.py"
 ```
 ##Resources
+```bash
 Limited by GitHub file upload constraints, we offer a Baidu Netdisk link to download the full Checkpoints folder.
+```
