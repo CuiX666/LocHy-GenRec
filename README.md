@@ -9,9 +9,9 @@ For representative studies on static identifier construction, please refer to th
 - [TIGER](https://github.com/EdoardoBotta/RQ-VAE-Recommender)
 - [LETTER](https://github.com/HonghuiBao2000/LETTER)
 
-**Requirement：**
-
-torch==2.7.1+cu118
+## Requirement
+```bash
+torch==2.7.1+cu118 
 
 accelerate
 
@@ -30,7 +30,7 @@ bitsandbytes
 tqdm
 
 transformers...
-
+```
 **GENREC**
 
 
