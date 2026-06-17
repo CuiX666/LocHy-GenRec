@@ -33,11 +33,12 @@ transformers...
 
 **GENREC**
 
+
 ## Run GENREC
 ```bash
 cd LocHy-GenRec
 python -u ".../group_estimation.py"
 python -u ".../hy_genrec.py"
-
+```
 **Resources**
 Limited by GitHub file upload constraints, we offer a Baidu Netdisk link to download the full Checkpoints folder.
