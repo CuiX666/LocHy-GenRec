@@ -29,15 +29,15 @@ os.environ.pop("HUGGINGFACEHUB_API_TOKEN", None)  # Remove invalid token
 import torch.nn as nn
 
 CONFIG = {
-    "items_json": "/home/One/data/Instruments/Instruments.item.json",          # Item data file
-    # "users_json": "/home/One/data/Instruments/ce_shi.results122.json",          # User data file (test)
-    # "users_json": "/home/One/data/Instruments/Instruments.results - copy.json",          # User data file (test)
-    "users_json": "/home/One/data/Instruments/Instruments.results.json", #ALL
+    "items_json": "./Instruments.item.json",          # Item data file
+    # "users_json": "./Instruments/ce_shi.results122.json",          # User data file (test)
+    # "users_json": "./Instruments.results - copy.json",          # User data file (test)
+    "users_json": "./Instruments.results.json", #ALL
 
-    "static_identifiers_json": "/home/One/data/Instruments/Instruments.index.json",  # Added static identifier file path
-    "output_dir": "/home/One/data/Instruments/recommendation_results_xiugai110_50",    # Output directory
-    "model_name": "/home/ubuntu/Public/Llama-3.2-1B",
-    # "model_name": "/home/ubuntu/Public/Qwen2.5-0.5B",
+    "static_identifiers_json": "./Instruments.index.json",  # Added static identifier file path
+    "output_dir": "./Instruments/recommendation_results",    # Output directory
+    "model_name": "./Llama-3.2-1B",
+    # "model_name": "./Qwen72B",
     "max_new_tokens": 300,                       # Adjust generation length
     "history_length": 6,                         # User history interaction retention length
     "top_k": 10,                                  # Recommendation list length  
@@ -50,7 +50,7 @@ CONFIG = {
         "lora_dropout": 0.1,
         "target_modules": ["q_proj", "v_proj"]
     },
-    "checkpoint_dir": "/home/One/data/Instruments/checkpoints",
+    "checkpoint_dir": "./checkpoints",
     "identifier_model": {
         "diversity_lambda": 0.1,  # Diversity loss weight
         "num_variants": 1,        # Number of variants per item
