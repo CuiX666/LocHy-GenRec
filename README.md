@@ -1,4 +1,4 @@
-##*Overview
+## Run Overview
 
 We propose LocHy-GenRec, which enables group-level modeling and constructs hybrid identifiers to support generative recommendation with item SID.
 
@@ -9,7 +9,7 @@ For representative studies on static identifier construction, please refer to th
 - [TIGER](https://github.com/EdoardoBotta/RQ-VAE-Recommender)
 - [LETTER](https://github.com/HonghuiBao2000/LETTER)
 
-## Requirement
+## Run Requirement
 ```bash
 torch==2.7.1+cu118 
 
@@ -38,7 +38,7 @@ cd LocHy-GenRec
 python -u ".../group_estimation.py"
 python -u ".../hy_genrec.py"
 ```
-##Resources
+##Run Resources
 ```bash
 Limited by GitHub file upload constraints, we offer a Baidu Netdisk link to download the full Checkpoints folder.
 ```
