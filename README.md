@@ -1,3 +1,5 @@
+
+
 ## Overview
 
 We propose LocHy-GenRec, which enables group-level modeling and constructs hybrid identifiers to support generative recommendation with item SID.
