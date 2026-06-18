@@ -3,8 +3,8 @@
 ## Overview
 
 We propose LocHy-GenRec, which enables group-level modeling and constructs hybrid identifiers to support generative recommendation with item SID.
+<img width="2102" height="1080" alt="模型图26 6 5" src="https://github.com/user-attachments/assets/65773800-17cb-444b-ad38-eba0e607e6d0" />
 
-<img width="1131" height="545" alt="模型图12 21" src="https://github.com/user-attachments/assets/8f325969-122f-4200-b7bc-5b7cd735e927" />
 
 ## Base
 For representative studies on static identifier construction, please refer to the following works:
