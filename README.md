@@ -9,6 +9,8 @@ For representative studies on static identifier construction, please refer to th
 - [TIGER](https://github.com/EdoardoBotta/RQ-VAE-Recommender)
 - [LETTER](https://github.com/HonghuiBao2000/LETTER)
 
+The required LLM can be downloaded via the [link] (https://developer.meta.com/ai/)
+
 ## Requirement
 ```bash
 torch==2.7.1+cu118 
