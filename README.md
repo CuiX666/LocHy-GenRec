@@ -8,10 +8,10 @@ We propose LocHy-GenRec, which enables group-level modeling and constructs hybri
 
 ## Base
 For representative studies on static identifier construction, please refer to the following works:
-- [TIGER](https://github.com/EdoardoBotta/RQ-VAE-Recommender)
-- [LETTER](https://github.com/HonghuiBao2000/LETTER)
+- [RQ-VAE-Recommendation](https://github.com/EdoardoBotta/RQ-VAE-Recommender)(Recommender Systems with Generative Retrieval)
+- [LETTER](https://github.com/HonghuiBao2000/LETTER)(Learnable Item Tokenization for Generative Recommendation)
 
-The required LLM can be downloaded via the [link](https://developer.meta.com/ai/).
+The required LLM can be downloaded via the [Meta](https://developer.meta.com/ai/).
 
 ## Requirement
 ```bash
